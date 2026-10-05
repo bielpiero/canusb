@@ -6,6 +6,7 @@ import math
 import rospy
 from geometry_msgs.msg import Pose2D
 from geometry_msgs.msg import Twist
+from geometry_msgs.msg import TwistStamped
 
 from canusb.msg import KinematicModelIncrement
 from typing import Optional
@@ -38,8 +39,9 @@ class CanUsb:
     self.lock = threading.Lock()
 
     #publishers
-    self.pose_pub = rospy.Publisher('/pose', Pose2D, queue_size=10)
-    self.inc_pub = rospy.Publisher('/kinematic_model_increment', KinematicModelIncrement, queue_size=10)
+    self.pose_pub = rospy.Publisher('/pose/raw', Pose2D, queue_size=10)
+    self.inc_pub = rospy.Publisher('/kinematics/increments', KinematicModelIncrement, queue_size=10)
+    self.speed_pub = rospy.Publisher('/kinematics/speeds', TwistStamped, queue_size=10)
     
     pose = Pose2D()
     pose.x = self.x
@@ -51,6 +53,14 @@ class CanUsb:
     inc.d_ang = 0.0
     inc.d_lin = 0.0
     self.inc_pub.publish(inc)
+
+    speed_msg = TwistStamped()
+    stamp = rospy.Time.now()
+    speed_msg.header.stamp = stamp
+    speed_msg.header.frame_id = "base_link"
+    self.speed_pub.publish(speed_msg)
+
+    self.last_kinematics_stamp = None
 
     # incrementos acumulados pendientes de integrar
     self.pending_d_lin = 0.0
@@ -67,7 +77,7 @@ class CanUsb:
     self.wheel_radius = rospy.get_param("~wheel_radius", 0.165)
     self.wheel_base = rospy.get_param("~wheel_base", 0.525)
     self.counts_per_rev = rospy.get_param("~counts_per_rev", 64000)
-    self.ticks_per_m = self._compute_ticks_per_m()
+    self.meters_per_tick = self._compute_ticks_per_m()
     self.k_param = 7.8125
     
     self.loop_mode = 65 # 65 -> Open Loop, 67 Closed Loop
@@ -201,57 +211,117 @@ class CanUsb:
       except Exception as e:
         rospy.logwarn(f"error in read loop {e}")
 
-  def update_odometry(self, enc_a = None, enc_b=None):
+  def update_odometry(self, enc_a=None, enc_b=None):
     publish_inc = False
+    publish_speed = False
+
     d_lin = 0.0
     d_yaw = 0.0
+    v = 0.0
+    omega = 0.0
+    stamp = None
+
     with self.lock:
       if enc_a is not None:
         self.current_enc_a = enc_a
         self.new_packet_a = True
+
       if enc_b is not None:
         self.current_enc_b = enc_b
         self.new_packet_b = True
-        
-      if self.new_packet_a == False or self.new_packet_b == False:
+
+      # Esperar hasta tener una muestra nueva de ambas ruedas
+      if not self.new_packet_a or not self.new_packet_b:
         return
-        
-      if self.last_enc_a is None:
+
+      stamp = rospy.Time.now()
+
+      # Primera pareja de encoders:
+      # solo inicializamos la referencia
+      if self.last_enc_a is None or self.last_enc_b is None:
         self.last_enc_a = self.current_enc_a
         self.last_enc_b = self.current_enc_b
+
+        self.last_kinematics_stamp = stamp
+
         self.new_packet_a = False
         self.new_packet_b = False
+
         return
-      
-      #print(f"current_enc_a: {self.current_enc_a}, last_enc_a: {self.last_enc_a}, current_enc_b: {self.current_enc_b}, last_enc_b: {self.last_enc_b}")
-        
-      delta_a = self.current_enc_a - self.last_enc_a
-      delta_b = self.current_enc_b - self.last_enc_b
-      
-      #print(f"delta_a: {delta_a}, delta_b: {delta_b}")
-      
+
+      # Incrementos de encoder
+      delta_a = self._encoder_delta(
+        self.current_enc_a,
+        self.last_enc_a
+      )
+
+      delta_b = self._encoder_delta(
+        self.current_enc_b,
+        self.last_enc_b
+      )
+
       self.last_enc_a = self.current_enc_a
       self.last_enc_b = self.current_enc_b
+
       self.new_packet_a = False
       self.new_packet_b = False
 
-      d_right = delta_a * self.ticks_per_m
-      d_left = delta_b * self.ticks_per_m
-      
-      #print(f"d_left: {d_left}, d_right: {d_right}")
+      # Desplazamiento de cada rueda
+      d_right = delta_a * self.meters_per_tick
+      d_left  = delta_b * self.meters_per_tick
 
-      d_lin = (d_left + d_right) * 0.5
-      d_yaw = (d_right - d_left) / self.wheel_base
+      # Incremento cinemático
+      d_lin = 0.5 * (d_left + d_right)
 
+      d_yaw = (
+        d_right - d_left
+      ) / self.wheel_base
+
+      # Tiempo transcurrido
+      dt = (
+        stamp - self.last_kinematics_stamp
+      ).to_sec()
+
+      self.last_kinematics_stamp = stamp
+
+      # Integración pendiente para /pose/raw
       self.pending_d_lin += d_lin
       self.pending_d_yaw += d_yaw
+
       publish_inc = True
-    
+
+      # Velocidad media medida durante este intervalo
+      if dt > 1e-6:
+        v = d_lin / dt
+        omega = d_yaw / dt
+
+        publish_speed = True
+
+    # ----------------------------------------------------
+    # Publicar incrementos
+    # ----------------------------------------------------
+
     if publish_inc:
       kmi = KinematicModelIncrement()
-      kmi.d_ang = d_yaw
+
       kmi.d_lin = d_lin
+      kmi.d_ang = d_yaw
+
       self.inc_pub.publish(kmi)
+
+    # ----------------------------------------------------
+    # Publicar velocidades
+    # ----------------------------------------------------
+
+    if publish_speed:
+      speed_msg = TwistStamped()
+
+      speed_msg.header.stamp = stamp
+      speed_msg.header.frame_id = "base_link"
+      speed_msg.twist.linear.x = v
+      speed_msg.twist.angular.z = omega
+
+      self.speed_pub.publish(speed_msg)
 
   def _update_pose_callback(self, msg: Pose2D):
     with self.lock:
