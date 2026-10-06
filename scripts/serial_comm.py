@@ -82,7 +82,7 @@ class CanUsb:
     
     self.loop_mode = 65 # 65 -> Open Loop, 67 Closed Loop
     self.pc_mode = 0
-    print(f"ticks_per_m; {self.ticks_per_m}")
+    print(f"meters_per_tick; {self.meters_per_tick}")
   
   def _cmd_vel_callback(self, msg: Twist):
     #TODO: to send speed commands to motors
@@ -210,6 +210,9 @@ class CanUsb:
         break
       except Exception as e:
         rospy.logwarn(f"error in read loop {e}")
+        
+  def _encoder_delta(self, current, previous):
+    return ((current- previous + 2**31) % 2**32) - 2**31
 
   def update_odometry(self, enc_a=None, enc_b=None):
     publish_inc = False
